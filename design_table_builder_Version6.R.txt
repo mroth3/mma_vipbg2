@@ -1,0 +1,848 @@
+#!/usr/bin/env Rscript
+
+# Phase-1 MMA Twin Simulation Design Table Builder
+# Generates Oracle AICc lookup tables for all 25 MMA submodels
+
+# Load required libraries
+suppressMessages({
+  library(optparse)
+  library(yaml)
+  library(jsonlite)
+})
+
+# =============================================================================
+# COMMAND LINE INTERFACE
+# =============================================================================
+
+option_list <- list(
+  make_option(c("--grid"), type = "character", 
+              help = "YAML parameter grid file"),
+  make_option(c("--out"), type = "character", 
+              help = "Output file prefix for design table"),
+  make_option(c("--delta-thresh"), type = "numeric", default = 10.0,
+              help = "ΔAIC threshold for oracle confidence set [default: 10.0]"),
+  make_option(c("--cell-id"), type = "character", default = NULL,
+              help = "Specific cell ID to process (optional, processes all if not specified)")
+)
+
+opt_parser <- OptionParser(option_list = option_list)
+opts <- parse_args(opt_parser)
+
+# Validate required arguments
+if (is.null(opts$grid) || is.null(opts$out)) {
+  stop("Both --grid and --out are required")
+}
+
+# Create output directory
+output_dir <- paste0(opts$out, "_design_table")
+dir.create(output_dir, recursive = TRUE, showWarnings = FALSE)
+
+# =============================================================================
+# DIAGNOSTICS AND LOGGING
+# =============================================================================
+
+# Global diagnostic storage
+diagnostic_log <- list()
+
+log_message <- function(message, details = list()) {
+  timestamp <- format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC")
+  entry <- list(
+    timestamp = timestamp,
+    message = message,
+    details = details
+  )
+  diagnostic_log <<- append(diagnostic_log, list(entry))
+  cat(sprintf("[%s] %s\n", timestamp, message))
+  if (length(details) > 0) {
+    cat("  Details:", toJSON(details, auto_unbox = TRUE), "\n")
+  }
+}
+
+write_diagnostic_file <- function(output_dir, error_details, failed_models = NULL) {
+  diag_file <- file.path(output_dir, "design_table_diagnostics.json")
+  
+  diagnostic_data <- list(
+    timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC"),
+    generator_version = "design_table_builder_v1.0",
+    execution_log = diagnostic_log,
+    error_summary = error_details,
+    failed_models = failed_models,
+    session_info = list(
+      r_version = R.version.string,
+      user = Sys.getenv("USER", "unknown"),
+      working_directory = getwd()
+    )
+  )
+  
+  writeLines(toJSON(diagnostic_data, pretty = TRUE), diag_file)
+  cat("Diagnostic file written to:", diag_file, "\n")
+  return(diag_file)
+}
+
+# =============================================================================
+# MATRIX UTILITIES (OpenMx-compatible)
+# =============================================================================
+
+# OpenMx-compatible positive definiteness check
+is_positive_definite <- function(mat, tol = 1e-8) {
+  if (!is.matrix(mat) || nrow(mat) != ncol(mat)) return(FALSE)
+  eigenvals <- eigen(mat, symmetric = TRUE, only.values = TRUE)$values
+  return(all(eigenvals > tol))
+}
+
+# Make matrix positive definite using eigenvalue adjustment
+make_positive_definite <- function(mat, tol = 1e-8) {
+  if (is_positive_definite(mat, tol)) return(mat)
+  
+  eigen_decomp <- eigen(mat, symmetric = TRUE)
+  eigenvals <- eigen_decomp$values
+  eigenvecs <- eigen_decomp$vectors
+  
+  # Adjust negative eigenvalues to tolerance
+  eigenvals[eigenvals < tol] <- tol
+  
+  # Reconstruct matrix
+  return(eigenvecs %*% diag(eigenvals) %*% t(eigenvecs))
+}
+
+# =============================================================================
+# MMA MODEL DESIGN TABLE (Phase-1 Specification)
+# =============================================================================
+
+create_mma_design_table <- function() {
+  # Complete 25-model MMA design table with Phase-1 parameter counts
+  # These must exactly match the sim_generator constraint functions
+  
+  log_message("Creating MMA design table with 25 models")
+  
+  design_table <- list(
+    
+    # Model 1: ACE - Full bivariate ACE model
+    list(
+      model_index = 1,
+      name = "ACE",
+      k = 16,  # All sex-specific A,C,E parameters + cross-trait correlations + means
+      constrain_sigma_mz = function(Sigma_MZ) { return(Sigma_MZ) },
+      constrain_sigma_dz = function(Sigma_DZ) { return(Sigma_DZ) }
+    ),
+    
+    # Model 2: AE - Drop all C components
+    list(
+      model_index = 2,
+      name = "AE", 
+      k = 12, # A + E parameters only
+      constrain_sigma_mz = function(Sigma_MZ) { return(Sigma_MZ) },
+      constrain_sigma_dz = function(Sigma_DZ) { return(Sigma_DZ) }
+    ),
+    
+    # Model 3: CE - Drop all A components (MZ = DZ constraint)
+    list(
+      model_index = 3,
+      name = "CE",
+      k = 12, # C + E parameters only
+      constrain_sigma_mz = function(Sigma_MZ) { return(Sigma_MZ) },
+      constrain_sigma_dz = function(Sigma_DZ) { return(Sigma_MZ) } # Key CE constraint: MZ = DZ
+    ),
+    
+    # Model 4: ACEra - Constrain genetic cross-trait correlation r_a = 0
+    list(
+      model_index = 4,
+      name = "ACEra",
+      k = 15, # Full ACE minus 1 parameter (r_a fixed to 0)
+      constrain_sigma_mz = function(Sigma_MZ) {
+        # Reduce genetic cross-trait contribution
+        Sigma_constrained <- Sigma_MZ
+        genetic_reduction <- 0.3  # Approximate genetic contribution to cross-trait cov
+        Sigma_constrained[1,3] <- Sigma_constrained[1,3] * (1 - genetic_reduction)
+        Sigma_constrained[3,1] <- Sigma_constrained[3,1] * (1 - genetic_reduction)
+        Sigma_constrained[2,4] <- Sigma_constrained[2,4] * (1 - genetic_reduction)
+        Sigma_constrained[4,2] <- Sigma_constrained[4,2] * (1 - genetic_reduction)
+        return(Sigma_constrained)
+      },
+      constrain_sigma_dz = function(Sigma_DZ) {
+        # Apply same constraint to DZ twins
+        Sigma_constrained <- Sigma_DZ
+        genetic_reduction <- 0.3
+        Sigma_constrained[1,3] <- Sigma_constrained[1,3] * (1 - genetic_reduction)
+        Sigma_constrained[3,1] <- Sigma_constrained[3,1] * (1 - genetic_reduction)
+        Sigma_constrained[2,4] <- Sigma_constrained[2,4] * (1 - genetic_reduction)
+        Sigma_constrained[4,2] <- Sigma_constrained[4,2] * (1 - genetic_reduction)
+        return(Sigma_constrained)
+      }
+    ),
+    
+    # Model 5: ACErc - Constrain shared environment cross-trait correlation r_c = 0
+    list(
+      model_index = 5,
+      name = "ACErc",
+      k = 15, # Full ACE minus 1 parameter (r_c fixed to 0)
+      constrain_sigma_mz = function(Sigma_MZ) {
+        # Reduce shared environment cross-trait contribution
+        Sigma_constrained <- Sigma_MZ
+        shared_env_reduction <- 0.2  # Approximate C contribution to cross-trait cov
+        Sigma_constrained[1,3] <- Sigma_constrained[1,3] * (1 - shared_env_reduction)
+        Sigma_constrained[3,1] <- Sigma_constrained[3,1] * (1 - shared_env_reduction)
+        Sigma_constrained[2,4] <- Sigma_constrained[2,4] * (1 - shared_env_reduction)
+        Sigma_constrained[4,2] <- Sigma_constrained[4,2] * (1 - shared_env_reduction)
+        return(Sigma_constrained)
+      },
+      constrain_sigma_dz = function(Sigma_DZ) {
+        # Apply same C constraint to DZ twins
+        Sigma_constrained <- Sigma_DZ
+        shared_env_reduction <- 0.2
+        Sigma_constrained[1,3] <- Sigma_constrained[1,3] * (1 - shared_env_reduction)
+        Sigma_constrained[3,1] <- Sigma_constrained[3,1] * (1 - shared_env_reduction)
+        Sigma_constrained[2,4] <- Sigma_constrained[2,4] * (1 - shared_env_reduction)
+        Sigma_constrained[4,2] <- Sigma_constrained[4,2] * (1 - shared_env_reduction)
+        return(Sigma_constrained)
+      }
+    ),
+    
+    # Model 6: ACEq - Equate all cross-trait correlations (r_a = r_c = r_e)
+    list(
+      model_index = 6,
+      name = "ACEq",
+      k = 14, # Constraint reduces parameters by 2
+      constrain_sigma_mz = function(Sigma_MZ) { return(Sigma_MZ) },
+      constrain_sigma_dz = function(Sigma_DZ) { return(Sigma_DZ) }
+    ),
+    
+    # Model 7: ACE0 - All cross-trait correlations = 0 (independent traits)
+    list(
+      model_index = 7,
+      name = "ACE0",
+      k = 13, # No cross-trait parameters (3 correlations removed)
+      constrain_sigma_mz = function(Sigma_MZ) {
+        # Zero all cross-trait covariances
+        Sigma_constrained <- Sigma_MZ
+        Sigma_constrained[1:2, 3:4] <- 0
+        Sigma_constrained[3:4, 1:2] <- 0
+        return(Sigma_constrained)
+      },
+      constrain_sigma_dz = function(Sigma_DZ) {
+        # Zero all cross-trait covariances for DZ as well
+        Sigma_constrained <- Sigma_DZ
+        Sigma_constrained[1:2, 3:4] <- 0
+        Sigma_constrained[3:4, 1:2] <- 0
+        return(Sigma_constrained)
+      }
+    ),
+    
+    # Model 8: A - Additive genetic only
+    list(
+      model_index = 8,
+      name = "A",
+      k = 8, # Only genetic parameters remain
+      constrain_sigma_mz = function(Sigma_MZ) { return(Sigma_MZ) },
+      constrain_sigma_dz = function(Sigma_DZ) {
+        # Genetic-only approximation: DZ reduced genetic correlation
+        return(0.7 * Sigma_DZ + 0.3 * diag(diag(Sigma_DZ)))
+      }
+    ),
+    
+    # Model 9: C - Shared environment only (MZ = DZ exactly)
+    list(
+      model_index = 9,
+      name = "C",
+      k = 8, # Only shared environment parameters
+      constrain_sigma_mz = function(Sigma_MZ) { return(Sigma_MZ) },
+      constrain_sigma_dz = function(Sigma_DZ) { return(Sigma_MZ) } # Key C constraint: MZ = DZ
+    ),
+    
+    # Model 10: E - Unique environment only (no twin covariances)
+    list(
+      model_index = 10,
+      name = "E",
+      k = 4, # Only unique environment (diagonal elements)
+      constrain_sigma_mz = function(Sigma_MZ) { return(diag(diag(Sigma_MZ))) },
+      constrain_sigma_dz = function(Sigma_DZ) { return(diag(diag(Sigma_DZ))) }
+    )
+  )
+  
+  # Models 11-25: Single and multi-component models with beta constraints
+  # Phase-1 specification parameter counts
+  additional_models <- list(
+    list(11, "Ab21", 9), list(12, "Cb21", 9), list(13, "Eb21", 5),
+    list(14, "Ab12", 9), list(15, "Cb12", 9), list(16, "Eb12", 5),
+    list(17, "ACb21", 13), list(18, "AEb21", 9), list(19, "CEb21", 9),
+    list(20, "ACb12", 13), list(21, "AEb12", 9), list(22, "CEb12", 9),
+    list(23, "Ab21b12", 6), list(24, "Cb21b12", 6), list(25, "Eb21b12", 2)
+  )
+  
+  # Add beta constraint models with appropriate constraint functions
+  for (model_spec in additional_models) {
+    model_idx <- model_spec[[1]]
+    model_name <- model_spec[[2]]
+    model_k <- model_spec[[3]]
+    
+    # Determine component type for constraint logic
+    component <- substr(model_name, 1, 1)  # A, C, or E
+    has_beta <- grepl("b", model_name)
+    
+    design_table[[model_idx]] <- list(
+      model_index = model_idx,
+      name = model_name,
+      k = model_k,
+      constrain_sigma_mz = function(Sigma_MZ) {
+        if (component == "E") {
+          return(diag(diag(Sigma_MZ)))  # E-only: diagonal
+        } else {
+          return(Sigma_MZ)  # A or C: preserve structure
+        }
+      },
+      constrain_sigma_dz = function(Sigma_DZ) {
+        if (component == "A") {
+          return(0.7 * Sigma_DZ + 0.3 * diag(diag(Sigma_DZ)))  # A-only pattern
+        } else if (component == "C") {
+          return(Sigma_MZ)  # C-only: MZ = DZ
+        } else {
+          return(diag(diag(Sigma_DZ)))  # E-only: diagonal
+        }
+      }
+    )
+  }
+  
+  # Multi-component models (models 17-22) need special handling
+  multi_component_specs <- list(
+    list(17, "ACb21", 13, c("A", "C")),
+    list(18, "AEb21", 9, c("A", "E")), 
+    list(19, "CEb21", 9, c("C", "E")),
+    list(20, "ACb12", 13, c("A", "C")),
+    list(21, "AEb12", 9, c("A", "E")),
+    list(22, "CEb12", 9, c("C", "E"))
+  )
+  
+  for (spec in multi_component_specs) {
+    model_idx <- spec[[1]]
+    components <- spec[[4]]
+    
+    design_table[[model_idx]]$constrain_sigma_mz <- function(Sigma_MZ) { return(Sigma_MZ) }
+    design_table[[model_idx]]$constrain_sigma_dz <- function(Sigma_DZ) {
+      if ("C" %in% components && !"A" %in% components) {
+        return(Sigma_MZ)  # CE model: MZ = DZ
+      } else {
+        return(Sigma_DZ)  # AC or AE: preserve DZ structure
+      }
+    }
+  }
+  
+  # Validate design table completeness
+  if (length(design_table) != 25) {
+    stop(paste("Design table validation failed: expected 25 models, got", length(design_table)))
+  }
+  
+  # Validate parameter counts match Phase-1 specification
+  expected_k_values <- c(16, 12, 12, 15, 15, 14, 13, 8, 8, 4,
+                        9, 9, 5, 9, 9, 5, 13, 9, 9, 13, 9, 9, 6, 6, 2)
+  actual_k_values <- sapply(design_table, function(x) x$k)
+  
+  if (!identical(actual_k_values, expected_k_values)) {
+    stop("Design table parameter count validation failed - k_vec mismatch")
+  }
+  
+  log_message("MMA design table created successfully", list(
+    n_models = length(design_table),
+    k_values = actual_k_values
+  ))
+  
+  return(design_table)
+}
+
+# =============================================================================
+# POPULATION -2LL COMPUTATION (Trace Method)
+# =============================================================================
+
+compute_population_minus2LL <- function(Sigma_model_MZ, Sigma_model_DZ, Sigma_true_MZ, Sigma_true_DZ, n_mz, n_dz) {
+  # Population -2LL using trace method (OpenMx-compatible)
+  # Formula: n * (log(det(Sigma_model)) + trace(solve(Sigma_model) * Sigma_true))
+  
+  # Validate inputs
+  if (!is_positive_definite(Sigma_model_MZ) || !is_positive_definite(Sigma_model_DZ)) {
+    return(list(neg2ll = NA, error = "Non-positive definite model matrices"))
+  }
+  
+  # MZ contribution
+  tryCatch({
+    log_det_mz <- determinant(Sigma_model_MZ, logarithm = TRUE)$modulus[1]
+    
+    # Use efficient trace computation: trace(A %*% B) = sum(A * t(B))
+    Sigma_inv_MZ <- solve(Sigma_model_MZ)
+    trace_mz <- sum(Sigma_inv_MZ * Sigma_true_MZ)  # Element-wise multiplication then sum
+    
+    neg2ll_mz <- n_mz * (log_det_mz + trace_mz)
+    
+    # DZ contribution  
+    log_det_dz <- determinant(Sigma_model_DZ, logarithm = TRUE)$modulus[1]
+    
+    Sigma_inv_DZ <- solve(Sigma_model_DZ)
+    trace_dz <- sum(Sigma_inv_DZ * Sigma_true_DZ)  # Element-wise multiplication then sum
+    
+    neg2ll_dz <- n_dz * (log_det_dz + trace_dz)
+    
+    # Total -2LL
+    total_neg2ll <- neg2ll_mz + neg2ll_dz
+    
+    # Validation
+    if (!is.finite(total_neg2ll) || total_neg2ll < 0) {
+      return(list(neg2ll = NA, error = paste("Invalid -2LL:", total_neg2ll)))
+    }
+    
+    return(list(
+      neg2ll = total_neg2ll,
+      neg2ll_mz = neg2ll_mz,
+      neg2ll_dz = neg2ll_dz,
+      trace_mz = trace_mz,
+      trace_dz = trace_dz,
+      log_det_mz = log_det_mz,
+      log_det_dz = log_det_dz,
+      error = NULL
+    ))
+    
+  }, error = function(e) {
+    return(list(neg2ll = NA, error = paste("Computation failed:", e$message)))
+  })
+}
+
+# =============================================================================
+# ACE COVARIANCE MATRIX CONSTRUCTION
+# =============================================================================
+
+build_ace_covariance_matrices <- function(params) {
+  # Build true Sigma_MZ and Sigma_DZ from ACE parameters
+  # Identical to sim_generator logic for consistency
+  
+  log_message("Building ACE covariance matrices", list(
+    a1 = params$a1, c1 = params$c1, e1 = params$e1,
+    a2 = params$a2, c2 = params$c2, e2 = params$e2,
+    r_a = params$r_a, r_c = params$r_c, r_e = params$r_e
+  ))
+  
+  # Extract parameters
+  a1 <- params$a1; a2 <- params$a2
+  c1 <- params$c1; c2 <- params$c2  
+  e1 <- params$e1; e2 <- params$e2
+  r_a <- params$r_a; r_c <- params$r_c; r_e <- params$r_e
+  
+  # Build component covariance matrices
+  A <- matrix(c(
+    a1^2,        a1*a2*r_a,
+    a1*a2*r_a,   a2^2
+  ), 2, 2)
+  
+  C <- matrix(c(
+    c1^2,        c1*c2*r_c,
+    c1*c2*r_c,   c2^2
+  ), 2, 2)
+  
+  E <- matrix(c(
+    e1^2,        e1*e2*r_e,
+    e1*e2*r_e,   e2^2
+  ), 2, 2)
+  
+  # Assemble full twin covariance matrices
+  # Order: (p1_t1, p1_t2, p2_t1, p2_t2)
+  
+  # MZ twins (genetic correlation = 1.0)
+  Sigma_MZ <- rbind(
+    cbind(A + C + E,  A + C),
+    cbind(A + C,      A + C + E)
+  )
+  
+  # DZ twins (genetic correlation = 0.5)
+  Sigma_DZ <- rbind(
+    cbind(A + C + E,  0.5 * A + C),
+    cbind(0.5 * A + C, A + C + E)
+  )
+  
+  # Ensure symmetry with OpenMx-compatible tolerances
+  Sigma_MZ <- (Sigma_MZ + t(Sigma_MZ)) / 2
+  Sigma_DZ <- (Sigma_DZ + t(Sigma_DZ)) / 2
+  
+  # Quality control checks
+  mz_eig <- eigen(Sigma_MZ, only.values = TRUE)$values
+  dz_eig <- eigen(Sigma_DZ, only.values = TRUE)$values
+  
+  pd_tolerance <- 1e-8  # OpenMx standard
+  qc_flags <- list(
+    pd_fail = any(mz_eig <= pd_tolerance) || any(dz_eig <= pd_tolerance),
+    mz_min_eig = min(mz_eig),
+    dz_min_eig = min(dz_eig),
+    mz_det = det(Sigma_MZ),
+    dz_det = det(Sigma_DZ),
+    tolerance_used = pd_tolerance
+  )
+  
+  if (qc_flags$pd_fail) {
+    warning("True covariance matrices not positive definite")
+  }
+  
+  return(list(
+    Sigma_MZ = Sigma_MZ,
+    Sigma_DZ = Sigma_DZ,
+    qc_flags = qc_flags,
+    A = A, C = C, E = E
+  ))
+}
+
+# =============================================================================
+# DESIGN TABLE COMPUTATION FOR SINGLE CELL
+# =============================================================================
+
+compute_cell_design_table <- function(cell_data, delta_thresh = 10.0, n_mz = 1000, n_dz = 1000) {
+  # Compute complete design table for a single grid cell
+  # Uses large sample sizes for stable population parameter estimation
+  
+  log_message("Computing design table for cell", list(
+    cell_id = cell_data$cell_id,
+    n_mz = n_mz,
+    n_dz = n_dz,
+    delta_thresh = delta_thresh
+  ))
+  
+  # Build true covariance matrices
+  cov_result <- build_ace_covariance_matrices(cell_data)
+  Sigma_true_MZ <- cov_result$Sigma_MZ
+  Sigma_true_DZ <- cov_result$Sigma_DZ
+  
+  if (cov_result$qc_flags$pd_fail) {
+    stop("True covariance matrices failed PD check")
+  }
+  
+  # Create deterministic signature for lookup matching
+  sigma_signature <- paste(round(c(Sigma_true_MZ, Sigma_true_DZ), 8), collapse = "_")
+  
+  # Load MMA design table
+  design_table <- create_mma_design_table()
+  
+  # Initialize results storage
+  results <- data.frame(
+    model_index = integer(25),
+    model_name = character(25),
+    k = integer(25),
+    neg2LL = numeric(25),
+    AIC = numeric(25),
+    AICc = numeric(25),
+    delta_AIC = numeric(25),
+    oracle_flag = integer(25),
+    computation_status = character(25),
+    stringsAsFactors = FALSE
+  )
+  
+  failed_models <- list()
+  
+  # Compute for each model
+  for (i in 1:25) {
+    model <- design_table[[i]]
+    
+    log_message(paste("Processing model", i), list(
+      name = model$name,
+      k = model$k
+    ))
+    
+    tryCatch({
+      # Apply model constraints
+      Sigma_model_MZ <- model$constrain_sigma_mz(Sigma_true_MZ)
+      Sigma_model_DZ <- model$constrain_sigma_dz(Sigma_true_DZ)
+      
+      # Ensure positive definiteness
+      Sigma_model_MZ <- make_positive_definite(Sigma_model_MZ, tol = 1e-8)
+      Sigma_model_DZ <- make_positive_definite(Sigma_model_DZ, tol = 1e-8)
+      
+      # Final PD check
+      if (!is_positive_definite(Sigma_model_MZ, 1e-8) || !is_positive_definite(Sigma_model_DZ, 1e-8)) {
+        stop("Model matrices not positive definite after correction")
+      }
+      
+      # Compute population -2LL
+      ll_result <- compute_population_minus2LL(
+        Sigma_model_MZ, Sigma_model_DZ,
+        Sigma_true_MZ, Sigma_true_DZ,
+        n_mz, n_dz
+      )
+      
+      if (!is.null(ll_result$error)) {
+        stop(ll_result$error)
+      }
+      
+      # Compute information criteria
+      neg2ll <- ll_result$neg2ll
+      k <- model$k
+      n_total <- n_mz + n_dz
+      
+      aic <- neg2ll + 2 * k
+      
+      # AICc with sample size correction
+      if (n_total - k - 1 > 0) {
+        aicc_correction <- (2 * k * (k + 1)) / (n_total - k - 1)
+        aicc <- aic + aicc_correction
+      } else {
+        aicc <- Inf  # Model too complex for sample size
+      }
+      
+      # Store results
+      results[i, ] <- list(
+        model_index = model$model_index,
+        model_name = model$name,
+        k = k,
+        neg2LL = neg2ll,
+        AIC = aic,
+        AICc = aicc,
+        delta_AIC = NA,  # Will compute after all models
+        oracle_flag = 0,  # Will set after delta computation
+        computation_status = "success"
+      )
+      
+    }, error = function(e) {
+      error_msg <- paste("Model", i, "failed:", e$message)
+      log_message(error_msg)
+      
+      failed_models[[length(failed_models) + 1]] <<- list(
+        model_index = i,
+        model_name = model$name,
+        error = e$message
+      )
+      
+      # Store failed model with NA values
+      results[i, ] <- list(
+        model_index = model$model_index,
+        model_name = model$name,
+        k = model$k,
+        neg2LL = NA,
+        AIC = NA,
+        AICc = NA,
+        delta_AIC = NA,
+        oracle_flag = 0,
+        computation_status = paste("failed:", e$message)
+      )
+    })
+  }
+  
+  # Compute delta AIC and oracle set
+  valid_aicc <- results$AICc[!is.na(results$AICc) & is.finite(results$AICc)]
+  
+  if (length(valid_aicc) == 0) {
+    stop("No valid AICc values computed")
+  }
+  
+  min_aicc <- min(valid_aicc)
+  results$delta_AIC <- results$AICc - min_aicc
+  results$delta_AIC[is.na(results$AICc) | !is.finite(results$AICc)] <- Inf
+  
+  # Oracle confidence set (ΔAIC ≤ threshold)
+  results$oracle_flag <- as.integer(results$delta_AIC <= delta_thresh)
+  results$oracle_flag[is.na(results$delta_AIC) | !is.finite(results$delta_AIC)] <- 0
+  
+  # Find top model
+  top_model_idx <- which.min(results$AICc)
+  top_model_name <- if (length(top_model_idx) > 0) results$model_name[top_model_idx] else "None"
+  
+  # Add metadata
+  results$sigma_signature <- sigma_signature
+  
+  oracle_set_size <- sum(results$oracle_flag)
+  n_valid_models <- sum(results$computation_status == "success")
+  
+  log_message("Design table computation complete", list(
+    n_valid_models = n_valid_models,
+    n_failed_models = length(failed_models),
+    oracle_set_size = oracle_set_size,
+    top_model = top_model_name,
+    min_aicc = min_aicc
+  ))
+  
+  if (length(failed_models) > 0) {
+    log_message("Failed models detected", list(failed_models = failed_models))
+  }
+  
+  return(list(
+    design_table = results,
+    metadata = list(
+      cell_id = cell_data$cell_id,
+      sigma_signature = sigma_signature,
+      n_models_attempted = 25,
+      n_models_successful = n_valid_models,
+      n_models_failed = length(failed_models),
+      oracle_set_size = oracle_set_size,
+      top_model_index = top_model_idx,
+      top_model_name = top_model_name,
+      min_aicc = min_aicc,
+      delta_threshold = delta_thresh,
+      sample_sizes = list(n_mz = n_mz, n_dz = n_dz),
+      timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC"),
+      generator_version = "design_table_builder_v1.0"
+    ),
+    failed_models = failed_models,
+    qc_flags = cov_result$qc_flags
+  ))
+}
+
+# =============================================================================
+# MAIN EXECUTION
+# =============================================================================
+
+main <- function() {
+  log_message("Starting design table builder", list(
+    grid_file = opts$grid,
+    output_prefix = opts$out,
+    delta_thresh = opts$`delta-thresh`,
+    target_cell = opts$`cell-id`
+  ))
+  
+  # Load parameter grid
+  if (!file.exists(opts$grid)) {
+    stop(paste("Grid file not found:", opts$grid))
+  }
+  
+  grid_data <- tryCatch({
+    read_yaml(opts$grid)
+  }, error = function(e) {
+    stop(paste("Failed to load grid file:", e$message))
+  })
+  
+  if (!"cells" %in% names(grid_data)) {
+    stop("Grid file must contain 'cells' section")
+  }
+  
+  cells_to_process <- grid_data$cells
+  
+  # Filter to specific cell if requested
+  if (!is.null(opts$`cell-id`)) {
+    target_cell <- NULL
+    for (cell in cells_to_process) {
+      if (!is.null(cell$cell_id) && cell$cell_id == opts$`cell-id`) {
+        target_cell <- cell
+        break
+      }
+    }
+    
+    if (is.null(target_cell)) {
+      available_ids <- sapply(cells_to_process, function(x) x$cell_id %||% "unnamed")
+      stop(paste("Cell ID", opts$`cell-id`, "not found. Available:", paste(available_ids, collapse = ", ")))
+    }
+    
+    cells_to_process <- list(target_cell)
+  }
+  
+  log_message("Processing cells", list(
+    n_cells = length(cells_to_process),
+    cell_ids = sapply(cells_to_process, function(x) x$cell_id %||% "unnamed")
+  ))
+  
+  # Process each cell
+  all_results <- list()
+  all_metadata <- list()
+  failed_cells <- list()
+  
+  for (i in seq_along(cells_to_process)) {
+    cell <- cells_to_process[[i]]
+    cell_id <- cell$cell_id %||% paste("cell", i)
+    
+    log_message(paste("Processing cell:", cell_id))
+    
+    tryCatch({
+      # Validate required parameters
+      required_params <- c("a1", "c1", "e1", "a2", "c2", "e2", "r_a", "r_c", "r_e")
+      missing_params <- setdiff(required_params, names(cell))
+      
+      if (length(missing_params) > 0) {
+        stop(paste("Missing parameters:", paste(missing_params, collapse = ", ")))
+      }
+      
+      # Compute design table for this cell
+      cell_result <- compute_cell_design_table(cell, opts$`delta-thresh`)
+      
+      # Store results
+      all_results[[cell_id]] <- cell_result$design_table
+      all_metadata[[cell_id]] <- cell_result$metadata
+      
+      log_message(paste("Cell", cell_id, "completed successfully"), list(
+        oracle_set_size = cell_result$metadata$oracle_set_size,
+        n_valid_models = cell_result$metadata$n_models_successful
+      ))
+      
+    }, error = function(e) {
+      error_msg <- paste("Cell", cell_id, "failed:", e$message)
+      log_message(error_msg)
+      
+      failed_cells[[cell_id]] <- list(
+        cell_id = cell_id,
+        error = e$message,
+        parameters = names(cell)
+      )
+    })
+  }
+  
+  if (length(all_results) == 0) {
+    write_diagnostic_file(output_dir, "No cells processed successfully", failed_cells)
+    stop("No design tables generated")
+  }
+  
+  # Combine results
+  combined_table <- do.call(rbind, all_results)
+  
+  # Save as RDS (for fast loading)
+  rds_file <- file.path(output_dir, "design_table.rds")
+  saveRDS(list(
+    design_table = combined_table,
+    metadata = all_metadata,
+    generation_info = list(
+      timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC"),
+      generator_version = "design_table_builder_v1.0",
+      grid_file = opts$grid,
+      delta_threshold = opts$`delta-thresh`,
+      n_cells_processed = length(all_results),
+      n_cells_failed = length(failed_cells)
+    )
+  ), rds_file)
+  
+  # Save as CSV (for inspection)
+  csv_file <- file.path(output_dir, "design_table.csv")
+  write.csv(combined_table, csv_file, row.names = FALSE)
+  
+  # Save metadata
+  metadata_file <- file.path(output_dir, "metadata.json")
+  writeLines(toJSON(list(
+    cell_metadata = all_metadata,
+    generation_info = list(
+      timestamp = format(Sys.time(), "%Y-%m-%d %H:%M:%S UTC"),
+      generator_version = "design_table_builder_v1.0",
+      grid_file = opts$grid,
+      delta_threshold = opts$`delta-thresh`,
+      n_cells_processed = length(all_results),
+      n_cells_failed = length(failed_cells)
+    ),
+    failed_cells = failed_cells
+  ), pretty = TRUE), metadata_file)
+  
+  # Write diagnostic log
+  if (length(failed_cells) > 0) {
+    write_diagnostic_file(output_dir, "Some cells failed processing", failed_cells)
+  }
+  
+  # Final summary
+  log_message("Design table generation complete", list(
+    output_files = list(
+      rds = rds_file,
+      csv = csv_file, 
+      metadata = metadata_file
+    ),
+    n_cells_processed = length(all_results),
+    n_cells_failed = length(failed_cells),
+    total_rows = nrow(combined_table)
+  ))
+  
+  cat("Design table builder completed successfully!\n")
+  cat("Output files:\n")
+  cat("  RDS:", rds_file, "\n")
+  cat("  CSV:", csv_file, "\n") 
+  cat("  Metadata:", metadata_file, "\n")
+  cat("Cells processed:", length(all_results), "\n")
+  cat("Total design table rows:", nrow(combined_table), "\n")
+  
+  if (length(failed_cells) > 0) {
+    cat("WARNING: Some cells failed processing. Check diagnostics.\n")
+  }
+}
+
+# Execute main function
+main()
